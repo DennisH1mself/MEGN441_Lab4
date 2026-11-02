@@ -1,0 +1,5 @@
+ssh ubuntu@192.168.55.1
+cd ~/l4b3_ws
+source install/setup.zsh
+
+mkdir l4b3_ws
