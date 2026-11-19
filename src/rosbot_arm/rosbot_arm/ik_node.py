@@ -1,7 +1,11 @@
-import rclpy
-from rclpy.node import Node
-from rosbot_msgs.msg import IKTarget, JointControl
 import numpy as np
+import rclpy
+from rclpy.action import ActionServer, GoalResponse, CancelResponse
+from rclpy.node import Node
+from rclpy.task import Future
+from rosbot_msgs.msg import IKTarget, JointControl
+from rosbot_msgs.action import Move
+
 
 ##  Joint Links ##
 # l0 is the shoulder height above base_footprint.
@@ -16,21 +20,30 @@ min_angles = [-120, -90, -120, -120, -120]
 max_angles = [120, 66, 120, 120, 120]
 
 
-def inverse_kinematics(x, y, z, roll, pitch):
+class RangeError(ValueError):
+    pass
+
+
+def inverse_kinematics(target: IKTarget):
+    x = target.x
+    y = target.y
+    z = target.z
+    roll = target.roll
+    pitch = target.pitch
     if not np.all(np.isfinite([x, y, z, roll, pitch])):
         raise ValueError('IK target must contain finite numbers.')
     radius = np.hypot(x, y)
     if radius < 1e-9:
-        raise ValueError('Target is on the base axis; rotation is undefined.')
+        raise RangeError('Target is on the base axis; rotation is undefined.')
     rotation = np.rad2deg(np.arctan2(y, x))
     # Wrist center relative to the shoulder; preserve the radial sign.
     v3z = z - l0 - (l3 + tool_link) * np.sin(np.deg2rad(pitch))
     v3rxy = radius - (l3 + tool_link) * np.cos(np.deg2rad(pitch))
     distance = np.hypot(v3rxy, v3z)
     if distance < 1e-9:
-        raise ValueError('Wrist center is at the shoulder; IK is singular.')
+        raise RangeError('Wrist center is at the shoulder; IK is singular.')
     if distance > l1 + l2 + 1e-9 or distance < abs(l1 - l2) - 1e-9:
-        raise ValueError('Target is outside the arm reach.')
+        raise RangeError('Target is outside the arm reach.')
 
     elbow = np.arccos(np.clip((distance**2 - l1**2 - l2**2) / (2 * l1 * l2), -1.0, 1.0))
     # Try both elbow bends; servo shoulder zero is upright (90 degrees).
@@ -44,42 +57,174 @@ def inverse_kinematics(x, y, z, roll, pitch):
     raise ValueError('Neither elbow bend fits the calibrated servo joint limits.')
 
 
+class ActionCanceled(Exception):
+    pass
+
+
 class IKNode(Node):
     def __init__(self):
         super().__init__('ik_node')
-        self.subscriber = self.create_subscription(
-            IKTarget, '/ik_target', self.ik_callback, 10
-        )
         self.publisher = self.create_publisher(
-            JointControl, '/joint_control', 10
-        )
-    def ik_callback(self, msg):
+            JointControl, '/joint_control', 10)
+        self.open_grip = 100
+        self.close_grip = 500
+        self.last_angles = None
+        self.cur_grip = self.open_grip
+        self.stow_position = IKTarget(
+            x=0.18, y=0.02, z=0.32, roll=0.0, pitch=-30.0)
+        self.busy = False
+
+        self.pick_server = ActionServer(
+            self, Move, '/pick', execute_callback=self.pick_callback,
+            goal_callback=self.goal_callback,
+            cancel_callback=self.cancel_callback)
+        self.place_server = ActionServer(
+            self, Move, '/place', execute_callback=self.place_callback,
+            goal_callback=self.goal_callback,
+            cancel_callback=self.cancel_callback)
+
+    def goal_callback(self, request):
+        if self.busy:
+            return GoalResponse.REJECT
+        self.busy = True
+        return GoalResponse.ACCEPT
+
+    def cancel_callback(self, goal_handle):
+        return CancelResponse.ACCEPT
+
+    def stow(self):
+        self.write_joints(inverse_kinematics(self.stow_position), self.cur_grip)
+
+    async def pause(self, goal_handle):
+        # Two-second wait using ROS, rather than an asyncio event loop.
+        future = Future(executor=self.executor)
+
+        def wake():
+            timer.cancel()
+            future.set_result(None)
+
+        timer = self.create_timer(2.0, wake)
         try:
-            if not 0 <= msg.gripper < 650:
-                raise ValueError('Gripper pulse must be between 0 and 649.')
-            angles = self.inverse_kinematics(
-                msg.x, msg.y, msg.z, msg.roll, msg.pitch
-            )
-        except ValueError as error:
-            self.get_logger().warn(str(error))
-            return
+            await future
+        finally:
+            self.destroy_timer(timer)
+        if goal_handle.is_cancel_requested:
+            raise ActionCanceled()
 
-        response = JointControl()
-        response.rotation, response.joint1, response.joint2, response.joint3, response.wrist = [
-            int(round(angle)) for angle in angles
-        ]
-        response.gripper = msg.gripper
-        self.publisher.publish(response)
+    async def pick_callback(self, goal_handle):
+        result = Move.Result()
+        feedback = Move.Feedback(busy=True)
+        try:
+            if goal_handle.is_cancel_requested:
+                raise ActionCanceled()
+            angles = inverse_kinematics(goal_handle.request)
+            inverse_kinematics(self.stow_position)
+            feedback.in_range = True
 
-    def inverse_kinematics(self, x, y, z, roll, pitch):
-        return inverse_kinematics(x, y, z, roll, pitch)
+            self.write_joints(angles, self.open_grip)
+            feedback.status = 'Moving to pick position'
+            goal_handle.publish_feedback(feedback)
+            await self.pause(goal_handle)
+
+            self.write_joints(angles, self.close_grip)
+            feedback.status = 'Closing gripper'
+            goal_handle.publish_feedback(feedback)
+            await self.pause(goal_handle)
+
+            self.stow()
+            feedback.status = 'Returning to stow position'
+            goal_handle.publish_feedback(feedback)
+            await self.pause(goal_handle)
+
+            goal_handle.succeed()
+            result.succeeded = True
+            feedback.status = 'Pick completed'
+        except ActionCanceled:
+            goal_handle.canceled()
+            feedback.status = 'Pick canceled'
+        except Exception as error:
+            goal_handle.abort()
+            result.error_occured = True
+            feedback.status = str(error)
+        finally:
+            self.busy = False
+            feedback.busy = False
+            goal_handle.publish_feedback(feedback)
+        return result
+
+    async def place_callback(self, goal_handle):
+        result = Move.Result()
+        feedback = Move.Feedback(busy=True)
+        try:
+            if goal_handle.is_cancel_requested:
+                raise ActionCanceled()
+            angles = inverse_kinematics(goal_handle.request)
+            inverse_kinematics(self.stow_position)
+            feedback.in_range = True
+
+            self.write_joints(angles, self.close_grip)
+            feedback.status = 'Moving to place position'
+            goal_handle.publish_feedback(feedback)
+            await self.pause(goal_handle)
+
+            self.write_joints(angles, self.open_grip)
+            feedback.status = 'Opening gripper'
+            goal_handle.publish_feedback(feedback)
+            await self.pause(goal_handle)
+
+            self.stow()
+            feedback.status = 'Returning to stow position'
+            goal_handle.publish_feedback(feedback)
+            await self.pause(goal_handle)
+
+            goal_handle.succeed()
+            result.succeeded = True
+            feedback.status = 'Place completed'
+        except ActionCanceled:
+            goal_handle.canceled()
+            feedback.status = 'Place canceled'
+        except Exception as error:
+            goal_handle.abort()
+            result.error_occured = True
+            feedback.status = str(error)
+        finally:
+            self.busy = False
+            feedback.busy = False
+            goal_handle.publish_feedback(feedback)
+        return result
+
+    def write_joints(self, angles, gripper):
+        msg = JointControl()
+        msg.rotation = int(round(angles[0]))
+        msg.joint1 = int(round(angles[1]))
+        msg.joint2 = int(round(angles[2]))
+        msg.joint3 = int(round(angles[3]))
+        msg.wrist = int(round(angles[4]))
+        msg.gripper = int(gripper)
+        self.publisher.publish(msg)
+        self.last_angles = np.array(angles).copy()
+        self.cur_grip = int(gripper)
+
+    def send_grip(self, gripper):
+        if self.last_angles is None:
+            raise ValueError('No arm position has been commanded yet.')
+        self.write_joints(self.last_angles, gripper)
 
 
-def main():
-    rclpy.init()
+def main(args=None):
+    rclpy.init(args=args)
     ik_node = IKNode()
-    rclpy.spin(ik_node)
-    rclpy.shutdown()
+    try:
+        rclpy.spin(ik_node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ik_node.pick_server.destroy()
+        ik_node.place_server.destroy()
+        ik_node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

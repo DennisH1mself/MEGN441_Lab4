@@ -84,7 +84,7 @@ class Sequencer(Node):
                 x=p.x, y=p.y+0.02, z=p.z-0.01, roll=0.0, pitch=self.pick_pitch, gripper=0)
             try:
                 for target in (self.target, self.return_target):
-                    inverse_kinematics(target.x, target.y, target.z, target.roll, target.pitch)
+                    inverse_kinematics(target)
             except ValueError as error:
                 self.get_logger().warn(f'Cannot pick {msg.color}: {error}', throttle_duration_sec=5.0)
                 return
