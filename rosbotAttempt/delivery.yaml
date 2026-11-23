@@ -1,0 +1,24 @@
+sequencer:
+  ros__parameters:
+    # Map frame: meters and degrees. Actual start measured using tf2_echo.
+    start_pose: [-3.543, -2.598, 37.640]
+    # Approximate MAP position of the red block. Camera refines the grasp.
+    estimated_block: [-2.988, -2.252]
+    approach_yaw_deg: 37.64
+    block_color: red
+    viewing_distance_m: 0.65
+    # Initial stand-off stays at your measured setting; if Nav2 aborts a
+    # refined approach, the sequencer tries 0.30 and 0.32 m before failing.
+    stand_off_m: 0.26
+    detection_window_m: 0.65
+    pick_pitch_deg: -45.0
+    pick_roll_deg: 0.0
+    grasp_offset: [0.0, 0.0, 0.0]
+    # MAP pose for where the robot base parks after picking up the block.
+    dropoff_pose: [-0.779, -0.410, 37.64]
+    # Arm release point RELATIVE to base_footprint, NOT in map coordinates.
+    place_pose: [0.25, 0.0, 0.04, -45.0, 0.0]
+    # Safety/robustness settings (all adjustable without rebuilding).
+    localization_timeout_s: 25.0
+    stop_timeout_s: 8.0
+    refined_approach_retry_m: [0.30, 0.32]

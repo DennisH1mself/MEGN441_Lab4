@@ -1,0 +1,9 @@
+float64 estimated_x
+float64 estimated_y
+string block_color
+---
+bool succeeded
+bool error_occured
+---
+int status
+string status_msg
