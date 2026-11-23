@@ -17,6 +17,14 @@
   <depend>tf2_ros</depend>
   <depend>tf2_geometry_msgs</depend>
 
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>rosbot</exec_depend>
+  <exec_depend>rosbot_nav</exec_depend>
+  <exec_depend>block_detector</exec_depend>
+  <exec_depend>nav_manager</exec_depend>
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

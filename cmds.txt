@@ -33,15 +33,16 @@ ros2 run rosbot_arm arm_control.py
 ros2 run rosbot_arm ik_node.py
 
 - Full System Setup
-ros2 launch rosbot sensors_launch.py
-ros2 launch rosbot_nav bringup_launch.py \
-   map:=/home/ubuntu/l4b3_ws/src/rosbot_nav/maps/Robo_Lab.yaml \
-   params_file:=/home/ubuntu/l4b3_ws/src/rosbot_nav/params/nav2_params.yaml \
-   use_sim_time:=false
-ros2 launch rosbot_nav rviz_launch.py
-ros2 launch rosbot_arm arm_launch.py
-ros2 run block_detector block_detector
-ros2 run nav_manager nav_manager
-ros2 run delivery_sequencer sequencer
+ros2 launch delivery_sequencer full_system_launch.py
 
+- RViz (separate terminal)
+ros2 launch rosbot_nav rviz_launch.py
+
+- Individual launches (alternative to Full System Setup; one per terminal)
+ros2 launch delivery_sequencer full_system_launch.py
+ros2 launch rosbot_nav rviz_launch.py
+ros2 topic echo /clicked_point
+ros2 action send_goal /find_and_pick rosbot_msgs/action/FindAndPick \
+"{mode: pick, estimated_x: PICK_X, estimated_y: PICK_Y, block_color: red}" \
+--feedback
 

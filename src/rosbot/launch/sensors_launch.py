@@ -1,8 +1,10 @@
 from ament_index_python.packages import get_package_share_directory
 import launch
 import launch_ros.actions
-from launch.actions import IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
 import os
 def generate_launch_description():
     # Find the location of the package on your computer
@@ -47,6 +49,7 @@ def generate_launch_description():
     # a list of all of the nodes, launch files, etc.
 
     rviz = launch_ros.actions.Node(
+        condition=IfCondition(LaunchConfiguration('launch_rviz')),
         package='rviz2',
         executable='rviz2',
         output='screen',
@@ -55,6 +58,7 @@ def generate_launch_description():
         ]
     )
     return launch.LaunchDescription([
+        DeclareLaunchArgument('launch_rviz', default_value='true'),
         lidar,
         laser_filter,
         camera_launch,
