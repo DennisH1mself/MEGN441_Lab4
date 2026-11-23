@@ -1,9 +1,11 @@
 float64 estimated_x
 float64 estimated_y
 string block_color
+# pick: find/pick, place: navigate/place, both: full delivery. Empty means both.
+string mode
 ---
 bool succeeded
 bool error_occured
 ---
-int status
+int32 status
 string status_msg

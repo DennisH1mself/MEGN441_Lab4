@@ -21,6 +21,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/BlockDetection.msg"
   "srv/GetJointAngle.srv"
   "action/Move.action"
+  "action/FindAndPick.action"
   DEPENDENCIES geometry_msgs std_msgs
 )
 

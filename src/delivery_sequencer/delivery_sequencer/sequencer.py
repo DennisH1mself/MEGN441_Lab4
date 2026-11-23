@@ -1,20 +1,19 @@
-import rclpy
-from rclpy.node import Node
-from rclpy.time import Time
-from tf2_ros import Buffer, TransformListener, TransformException
-from tf2_geometry_msgs import do_transform_point
-from geometry_msgs.msg import PointStamped
-from sensor_msgs.msg import JointState
-from rosbot_msgs.msg import BlockDetection, IKTarget
-from rosbot_arm.ik_node import inverse_kinematics
-
-#Action server bullshit import
-import asyncio
-import threading
-from rclpy.action import ActionServer, GoalResponse, CancelResponse
-from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
 from enum import Enum
+import math
+
+import rclpy
+from action_msgs.msg import GoalStatus
+from geometry_msgs.msg import PointStamped
+from nav2_msgs.action import NavigateToPose
+from rclpy.action import ActionClient, ActionServer, GoalResponse, CancelResponse
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.time import Time
+from rosbot_msgs.action import FindAndPick, Move
+from rosbot_msgs.msg import BlockDetection
+from tf2_geometry_msgs import do_transform_point
+from tf2_ros import Buffer, TransformListener, TransformException
+
 
 class SequencerState(Enum):
     WAITING_FOR_INPUT = 0
@@ -26,92 +25,470 @@ class SequencerState(Enum):
     DONE = 6
     FAILED = 7
 
+
 class Sequencer(Node):
     def __init__(self):
         super().__init__('sequencer')
-        
-        #defining pick server
-        self.sequencer_server = ActionServer(self, Pick, '/pick', execute_callback=self.pick_callback)
+        self.state = SequencerState.WAITING_FOR_INPUT
+        self.detection = None
+        self.navigation_goal = None
+        self.arm_goal = None
+        self.delivery_goal = None
+        self.target_color = None
+        self.block_found = False
+        # Required for place/both: map [x, y, yaw] and arm [x, y, z, roll, pitch].
+        self.declare_parameter('delivery_pose', Parameter.Type.DOUBLE_ARRAY)
+        self.declare_parameter('place_target', Parameter.Type.DOUBLE_ARRAY)
+        self.declare_parameter('pick_pitch', -45.0)
+
+        self.navigation_client = ActionClient(
+            self, NavigateToPose, '/navigate')
+
+        self.pick_client = ActionClient(
+            self, Move, '/pick')
+
+        self.place_client = ActionClient(
+            self, Move, '/place')
+
+        self.sequencer_server = ActionServer(
+            self,
+            FindAndPick,
+            '/find_and_pick',
+            execute_callback=self.find_and_pick_callback,
+            goal_callback=self.goal_callback,
+            cancel_callback=self.cancel_callback,
+        )
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.ik_pub = self.create_publisher(IKTarget, '/ik_target', 10)
-        self.subscriber = self.create_subscription(BlockDetection, '/block_detector/block_detections', self.block_callback, 10)
-        self.joint_subscriber = self.create_subscription(JointState, '/controller_manager/joint_states', self.joint_callback, 10)
+        self.subscriber = self.create_subscription(
+            BlockDetection, '/block_detector/block_detections',
+            self.block_callback, 10)
 
-        self.detection = None
-        self.joint_time = None
-        self.accept_after = None
-        self.step = 0
-        self.next_step = 0
-        self.pick_pitch = float(self.declare_parameter('pick_pitch', -45.0).value)
-        self.return_target = IKTarget(
-            x=0.18, y=0.02, z=0.3, roll=0.0, pitch=-60.0, gripper=500)
-        self.timer = self.create_timer(0.1, self.update)
-        self.get_logger().info('Sequencer ready: waiting for a block')
-
-    def joint_callback(self, msg):
-        self.joint_time = Time.from_msg(msg.header.stamp)
-        if self.accept_after is None:
-            self.accept_after = self.joint_time
-
+        self.block_locations = {
+            'red': None,
+            'green': None,
+            'blue': None,
+        }
     def block_callback(self, msg):
-        if self.step == 0 and self.detection is None:
-            self.detection = msg
+        color = msg.color.lower()
+        if color in self.block_locations:
+            self.block_locations[color] = msg
+            self.get_logger().info(
+                f'Received {color} block at '
+                f'({msg.position.x:.2f}, {msg.position.y:.2f}, {msg.position.z:.2f})',
+                throttle_duration_sec=1.0)
+            self.navigation_feedback_callback(None)
 
-    def update(self):
-        if self.step == 0 and self.detection is None:
-            return
-        now = self.get_clock().now()
-        if self.joint_time is None or (now - self.joint_time).nanoseconds > 1_000_000_000:
-            self.get_logger().warn('Waiting for arm_control feedback', throttle_duration_sec=5.0)
-            return
+    def goal_callback(self, request):
+        if (self.navigation_goal is not None or self.arm_goal is not None or
+                (self.delivery_goal is not None and self.delivery_goal.is_active)):
+            return GoalResponse.REJECT
+        if (self.delivery_goal is None and self.state not in (
+                SequencerState.WAITING_FOR_INPUT, SequencerState.DONE,
+                SequencerState.FAILED)):
+            return GoalResponse.REJECT
+        mode = (request.mode or 'both').lower()
+        if mode not in ('pick', 'place', 'both'):
+            return GoalResponse.REJECT
+        color = request.block_color.lower()
+        if mode != 'place':
+            if (color not in self.block_locations or
+                    not all(math.isfinite(v) for v in (
+                        request.estimated_x, request.estimated_y))):
+                return GoalResponse.REJECT
 
-        # Timer steps replace sleeps, leaving TF and feedback callbacks free to run.
-        if now.nanoseconds < self.next_step:
-            return
-        if self.step == 1:
-            self.target.gripper = 500
-            self.ik_pub.publish(self.target)
-            self.get_logger().info('Closing gripper')
-            self.step = 2
-            self.next_step = now.nanoseconds + 2_000_000_000
-        elif self.step == 2:
-            self.ik_pub.publish(self.return_target)
-            self.get_logger().info('Returning arm')
-            self.step = 3
-            self.next_step = now.nanoseconds + 10_000_000_000
-        elif self.step == 3:
-            self.step = 0
-            self.accept_after = now
-            self.get_logger().info('Ready for another block')
-        else:
-            msg = self.detection
-            image_time = Time.from_msg(msg.header.stamp)
-            if image_time < self.accept_after or (now - image_time).nanoseconds > 1_000_000_000:
-                self.detection = None
-                return
+        self.target_color = color if mode != 'place' else None
+        self.block_locations = {color: None for color in self.block_locations}
+        self.block_found = False
+        self.delivery_goal = None
+        self.state = (SequencerState.MOVING_TO_PLACE_POSITION if mode == 'place'
+                      else SequencerState.MOVING_TO_BLOCK_ESTIMATE)
+        return GoalResponse.ACCEPT
+
+    def cancel_callback(self, goal_handle):
+        for active_goal in (self.navigation_goal, self.arm_goal):
+            if active_goal is not None:
+                active_goal.cancel_goal_async()
+        self.publish_feedback(goal_handle, 'Cancellation requested')
+        return CancelResponse.ACCEPT
+
+    async def find_and_pick_callback(self, goal_handle):
+        self.delivery_goal = goal_handle
+        mode = (goal_handle.request.mode or 'both').lower()
+        result = FindAndPick.Result()
+        try:
+            if goal_handle.is_cancel_requested:
+                self.state = SequencerState.WAITING_FOR_INPUT
+                goal_handle.canceled()
+                return result
+            if mode not in ('pick', 'place', 'both'):
+                raise ValueError('mode must be pick, place, or both')
+
+            # Check the destination before picking up a block for delivery.
+            if mode in ('place', 'both'):
+                pose = self.get_parameter_or('delivery_pose').value
+                if (pose is None or len(pose) != 3 or
+                        not all(math.isfinite(v) for v in pose)):
+                    raise ValueError('Set delivery_pose to map [x, y, yaw radians]')
+                target = self.get_parameter_or('place_target').value
+                if (target is None or len(target) != 5 or
+                        not all(math.isfinite(v) for v in target)):
+                    raise ValueError('Set place_target to arm [x, y, z, roll, pitch degrees]')
+
+            success = True
+            if mode in ('pick', 'both'):
+                success = await self.move_to_block_estimate(goal_handle)
+                if success and not goal_handle.is_cancel_requested:
+                    success = await self.move_to_block_in_sight(goal_handle)
+                if success and not goal_handle.is_cancel_requested:
+                    success = await self.pick_block(goal_handle)
+
+            if (success and mode in ('place', 'both') and
+                    not goal_handle.is_cancel_requested):
+                success = await self.move_to_place_position(goal_handle)
+                if success and not goal_handle.is_cancel_requested:
+                    success = await self.place_block(goal_handle)
+
+            if goal_handle.is_cancel_requested:
+                self.state = SequencerState.WAITING_FOR_INPUT
+                self.publish_feedback(goal_handle, 'Operation canceled')
+                goal_handle.canceled()
+            elif not success:
+                self.state = SequencerState.FAILED
+                goal_handle.abort()
+                result.error_occured = True
+            else:
+                self.state = SequencerState.DONE
+                status_msg = ('Pickup complete; arm stowed' if mode == 'pick'
+                              else 'Delivery complete; arm stowed')
+                self.publish_feedback(goal_handle, status_msg)
+                goal_handle.succeed()
+                result.succeeded = True
+        except Exception as error:
+            self.get_logger().error(str(error))
+            self.state = SequencerState.FAILED
+            self.publish_feedback(goal_handle, str(error))
+            goal_handle.abort()
+            result.error_occured = True
+        finally:
+            self.delivery_goal = None
+        return result
+
+    async def move_to_block_estimate(self, goal_handle):
+        # Stop estimate navigation when a recent matching block is detected.
+        self.delivery_goal = goal_handle
+        self.state = SequencerState.MOVING_TO_BLOCK_ESTIMATE
+        estimated_x = goal_handle.request.estimated_x
+        estimated_y = goal_handle.request.estimated_y
+        self.target_color = goal_handle.request.block_color.lower()
+        self.block_found = False
+        self.navigation_goal = None
+        try:
+            if goal_handle.is_cancel_requested:
+                return False
+            if not self.navigation_client.server_is_ready():
+                raise RuntimeError('Navigation server is not ready')
+            self.publish_feedback(goal_handle, 'Moving toward the pickup estimate')
+
+            nav_goal = NavigateToPose.Goal()
+            nav_goal.pose.header.frame_id = 'map'
+            nav_goal.pose.header.stamp = self.get_clock().now().to_msg()
+            nav_goal.pose.pose.position.x = estimated_x
+            nav_goal.pose.pose.position.y = estimated_y
+            nav_goal.pose.pose.orientation.w = 1.0  # Example: yaw = 0.
+            nav_handler = await self.navigation_client.send_goal_async(
+                nav_goal,
+                feedback_callback=self.navigation_feedback_callback,
+            )
+
+            if not nav_handler.accepted:
+                raise RuntimeError("Navigation goal was rejected")
+
+            self.navigation_goal = nav_handler
+            if goal_handle.is_cancel_requested:
+                nav_handler.cancel_goal_async()
+            # A detection may have arrived before the goal was accepted.
+            self.navigation_feedback_callback(None)
+            nav_response = await nav_handler.get_result_async()
+            if goal_handle.is_cancel_requested:
+                return False
+            if self.block_found and nav_response.status in (
+                    GoalStatus.STATUS_CANCELED, GoalStatus.STATUS_SUCCEEDED):
+                # Wait for navigation to finish stopping before advancing.
+                self.state = SequencerState.MOVING_TO_BLOCK_IN_SIGHT
+                self.publish_feedback(goal_handle, 'Block located; estimate navigation stopped')
+                self.get_logger().info('Block located; estimate navigation stopped')
+                return True
+            if nav_response.status != GoalStatus.STATUS_SUCCEEDED:
+                raise RuntimeError('Navigation not successful')
+            raise RuntimeError('Reached the estimate without locating the block')
+        except Exception as e:
+            self.get_logger().error(str(e))
+            self.state = SequencerState.FAILED
+            self.publish_feedback(goal_handle, str(e))
+            return False
+        finally:
+            self.navigation_goal = None
+
+    async def move_to_block_in_sight(self, goal_handle):
+        self.delivery_goal = goal_handle
+        self.state = SequencerState.MOVING_TO_BLOCK_IN_SIGHT
+        try:
+            if goal_handle.is_cancel_requested:
+                return False
+            if not self.navigation_client.server_is_ready():
+                raise RuntimeError('Navigation server is not ready')
+
+            color = goal_handle.request.block_color.lower()
+            detection = self.block_locations.get(color)
+            if detection is None:
+                raise RuntimeError(f'No {color} block detection available')
+            image_time = Time.from_msg(detection.header.stamp)
+            age = (self.get_clock().now() - image_time).nanoseconds / 1e9
+            if not 0.0 <= age <= 1.0:
+                raise RuntimeError('Block detection is stale')
+
             point = PointStamped()
-            point.header, point.point = msg.header, msg.position
-            try:
-                transform = self.tf_buffer.lookup_transform(
-                    'base_footprint', msg.header.frame_id, image_time)
-                p = do_transform_point(point, transform).point
-            except TransformException as error:
-                self.get_logger().warn(f'Waiting for TF: {error}', throttle_duration_sec=5.0)
-                return  # Keep this image and retry on the next timer tick.
-            self.detection = None
-            self.target = IKTarget(
-                x=p.x, y=p.y+0.02, z=p.z-0.01, roll=0.0, pitch=self.pick_pitch, gripper=0)
-            try:
-                for target in (self.target, self.return_target):
-                    inverse_kinematics(target)
-            except ValueError as error:
-                self.get_logger().warn(f'Cannot pick {msg.color}: {error}', throttle_duration_sec=5.0)
-                return
-            self.ik_pub.publish(self.target)
-            self.get_logger().info(f'Moving to {msg.color}: x={p.x:.3f}, y={p.y:.3f}, z={p.z:.3f}')
-            self.step = 1
-            self.next_step = now.nanoseconds + 2_000_000_000
+            point.header, point.point = detection.header, detection.position
+            transform = self.tf_buffer.lookup_transform(
+                'map', detection.header.frame_id, image_time)
+            block = do_transform_point(point, transform).point
+            if not all(math.isfinite(v) for v in (block.x, block.y, block.z)):
+                raise RuntimeError('Block position is invalid')
+
+            robot = self.tf_buffer.lookup_transform(
+                'map', 'base_footprint', Time()).transform.translation
+            yaw = math.atan2(block.y - robot.y, block.x - robot.x)
+            stand_off = 0.25  # Metres from robot base to block; tune for the arm.
+
+            nav_goal = NavigateToPose.Goal()
+            nav_goal.pose.header.frame_id = 'map'
+            nav_goal.pose.header.stamp = self.get_clock().now().to_msg()
+            nav_goal.pose.pose.position.x = block.x - stand_off * math.cos(yaw)
+            nav_goal.pose.pose.position.y = block.y - stand_off * math.sin(yaw)
+            nav_goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
+            nav_goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
+
+            nav_handle = await self.navigation_client.send_goal_async(
+                nav_goal, feedback_callback=self.navigation_feedback_callback)
+            if not nav_handle.accepted:
+                raise RuntimeError('Approach navigation was rejected')
+
+            self.navigation_goal = nav_handle
+            if goal_handle.is_cancel_requested:
+                nav_handle.cancel_goal_async()
+            self.publish_feedback(goal_handle, 'Approaching the detected block')
+            response = await nav_handle.get_result_async()
+            if goal_handle.is_cancel_requested:
+                return False
+            if response.status != GoalStatus.STATUS_SUCCEEDED:
+                raise RuntimeError('Approach navigation failed')
+
+            self.state = SequencerState.PICKING_BLOCK
+            return True
+        except Exception as error:
+            self.get_logger().error(str(error))
+            self.state = SequencerState.FAILED
+            self.publish_feedback(goal_handle, str(error))
+            return False
+        finally:
+            self.navigation_goal = None
+
+    async def pick_block(self, goal_handle):
+        self.delivery_goal = goal_handle
+        self.state = SequencerState.PICKING_BLOCK
+        self.target_color = goal_handle.request.block_color.lower()
+        try:
+            if goal_handle.is_cancel_requested:
+                return False
+            if not self.pick_client.server_is_ready():
+                raise RuntimeError('Pick server is not ready')
+            block = self.get_block_position('base_footprint')
+            if block is None:
+                raise RuntimeError('No recent block position available for picking')
+
+            # Preserve the camera offsets used by the previous arm sequencer.
+            target = Move.Goal(
+                x=block.point.x, y=block.point.y + 0.02,
+                z=block.point.z - 0.01, roll=0.0,
+                pitch=float(self.get_parameter('pick_pitch').value))
+            self.publish_feedback(goal_handle, 'Picking the block')
+            arm_handle = await self.pick_client.send_goal_async(
+                target, feedback_callback=self.pick_feedback_callback)
+            if not arm_handle.accepted:
+                raise RuntimeError('Pick goal was rejected')
+
+            self.arm_goal = arm_handle
+            if goal_handle.is_cancel_requested:
+                arm_handle.cancel_goal_async()
+            response = await arm_handle.get_result_async()
+            if goal_handle.is_cancel_requested:
+                return False
+            if (response.status != GoalStatus.STATUS_SUCCEEDED or
+                    not response.result.succeeded or response.result.error_occured):
+                raise RuntimeError('Pick failed')
+
+            self.state = SequencerState.MOVING_TO_PLACE_POSITION
+            self.publish_feedback(goal_handle, 'Block picked; arm stowed')
+            return True
+        except Exception as error:
+            self.get_logger().error(str(error))
+            self.state = SequencerState.FAILED
+            self.publish_feedback(goal_handle, str(error))
+            return False
+        finally:
+            self.arm_goal = None
+
+    async def move_to_place_position(self, goal_handle):
+        self.delivery_goal = goal_handle
+        self.state = SequencerState.MOVING_TO_PLACE_POSITION
+        try:
+            if goal_handle.is_cancel_requested:
+                return False
+            pose = self.get_parameter_or('delivery_pose').value
+            if (pose is None or len(pose) != 3 or
+                    not all(math.isfinite(v) for v in pose)):
+                raise ValueError('Set delivery_pose to map [x, y, yaw radians]')
+            if not self.navigation_client.server_is_ready():
+                raise RuntimeError('Navigation server is not ready')
+
+            x, y, yaw = pose
+            target = NavigateToPose.Goal()
+            target.pose.header.frame_id = 'map'
+            target.pose.header.stamp = self.get_clock().now().to_msg()
+            target.pose.pose.position.x = x
+            target.pose.pose.position.y = y
+            target.pose.pose.orientation.z = math.sin(yaw / 2.0)
+            target.pose.pose.orientation.w = math.cos(yaw / 2.0)
+            self.publish_feedback(goal_handle, 'Navigating to the delivery position')
+            nav_handle = await self.navigation_client.send_goal_async(
+                target, feedback_callback=self.navigation_feedback_callback)
+            if not nav_handle.accepted:
+                raise RuntimeError('Delivery navigation was rejected')
+
+            self.navigation_goal = nav_handle
+            if goal_handle.is_cancel_requested:
+                nav_handle.cancel_goal_async()
+            response = await nav_handle.get_result_async()
+            if goal_handle.is_cancel_requested:
+                return False
+            if response.status != GoalStatus.STATUS_SUCCEEDED:
+                raise RuntimeError('Delivery navigation failed')
+
+            self.state = SequencerState.PLACING_BLOCK
+            self.publish_feedback(goal_handle, 'Reached the delivery position')
+            return True
+        except Exception as error:
+            self.get_logger().error(str(error))
+            self.state = SequencerState.FAILED
+            self.publish_feedback(goal_handle, str(error))
+            return False
+        finally:
+            self.navigation_goal = None
+
+    async def place_block(self, goal_handle):
+        self.delivery_goal = goal_handle
+        self.state = SequencerState.PLACING_BLOCK
+        try:
+            if goal_handle.is_cancel_requested:
+                return False
+            pose = self.get_parameter_or('place_target').value
+            if (pose is None or len(pose) != 5 or
+                    not all(math.isfinite(v) for v in pose)):
+                raise ValueError('Set place_target to arm [x, y, z, roll, pitch degrees]')
+            if not self.place_client.server_is_ready():
+                raise RuntimeError('Place server is not ready')
+
+            x, y, z, roll, pitch = pose
+            target = Move.Goal(x=x, y=y, z=z, roll=roll, pitch=pitch)
+            self.publish_feedback(goal_handle, 'Placing the block')
+            arm_handle = await self.place_client.send_goal_async(
+                target, feedback_callback=self.place_feedback_callback)
+            if not arm_handle.accepted:
+                raise RuntimeError('Place goal was rejected')
+
+            self.arm_goal = arm_handle
+            if goal_handle.is_cancel_requested:
+                arm_handle.cancel_goal_async()
+            response = await arm_handle.get_result_async()
+            if goal_handle.is_cancel_requested:
+                return False
+            if (response.status != GoalStatus.STATUS_SUCCEEDED or
+                    not response.result.succeeded or response.result.error_occured):
+                raise RuntimeError('Place failed')
+
+            self.state = SequencerState.DONE
+            self.publish_feedback(goal_handle, 'Block placed; arm stowed')
+            return True
+        except Exception as error:
+            self.get_logger().error(str(error))
+            self.state = SequencerState.FAILED
+            self.publish_feedback(goal_handle, str(error))
+            return False
+        finally:
+            self.arm_goal = None
+
+    def get_block_position(self, target_frame):
+        detection = self.block_locations.get(self.target_color)
+        if detection is None or detection.color.lower() != self.target_color:
+            return None
+        image_time = Time.from_msg(detection.header.stamp)
+        age = (self.get_clock().now() - image_time).nanoseconds / 1e9
+        if not 0.0 <= age <= 1.0:
+            return None
+        try:
+            point = PointStamped()
+            point.header, point.point = detection.header, detection.position
+            transform = self.tf_buffer.lookup_transform(
+                target_frame, detection.header.frame_id, image_time)
+            transformed = do_transform_point(point, transform)
+            if not all(math.isfinite(v) for v in (
+                    transformed.point.x, transformed.point.y, transformed.point.z)):
+                return None
+            return transformed
+        except TransformException as error:
+            self.get_logger().warn(f'Waiting for block TF: {error}',
+                                   throttle_duration_sec=5.0)
+            return None
+
+    def navigation_feedback_callback(self, feedback_msg):
+        if feedback_msg is not None:
+            status_msg = f'Distance remaining: {feedback_msg.feedback.distance_remaining:.2f} m'
+            self.get_logger().info(
+                status_msg, throttle_duration_sec=1.0)
+            self.publish_feedback(self.delivery_goal, status_msg)
+
+        if (self.state != SequencerState.MOVING_TO_BLOCK_ESTIMATE or
+                self.navigation_goal is None or self.block_found):
+            return
+
+        detection = self.block_locations.get(self.target_color)
+        if detection is None:
+            return
+        age = (self.get_clock().now() -
+               Time.from_msg(detection.header.stamp)).nanoseconds / 1e9
+        if not 0.0 <= age <= 1.0:
+            return
+
+        self.navigation_goal.cancel_goal_async()
+        self.block_found = True  # Prevent repeated cancellation requests.
+        self.get_logger().info(
+            f'{self.target_color} block detected; canceling estimate navigation')
+
+    def pick_feedback_callback(self, feedback_msg):
+        status_msg = f'Pick: {feedback_msg.feedback.status}'
+        self.get_logger().info(status_msg, throttle_duration_sec=1.0)
+        self.publish_feedback(self.delivery_goal, status_msg)
+
+    def place_feedback_callback(self, feedback_msg):
+        status_msg = f'Place: {feedback_msg.feedback.status}'
+        self.get_logger().info(status_msg, throttle_duration_sec=1.0)
+        self.publish_feedback(self.delivery_goal, status_msg)
+
+    def publish_feedback(self, goal_handle, status_msg):
+        if goal_handle is not None and goal_handle.is_active:
+            goal_handle.publish_feedback(FindAndPick.Feedback(
+                status=self.state.value, status_msg=status_msg))
 
 
 def main():
