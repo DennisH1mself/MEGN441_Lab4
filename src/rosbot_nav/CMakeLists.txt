@@ -7,6 +7,8 @@ find_package(navigation2 REQUIRED)
 
 nav2_package()
 
+install(PROGRAMS scripts/ackermann_limit.py DESTINATION lib/${PROJECT_NAME})
+
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY maps DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY rviz DESTINATION share/${PROJECT_NAME})

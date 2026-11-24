@@ -163,7 +163,8 @@ def generate_launch_description():
                               'container_name': 'nav2_container'}.items()),
 
         IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(os.path.join(launch_dir, 'navigation_launch.py')),
+            PythonLaunchDescriptionSource(os.path.join(
+                get_package_share_directory('rosbot_nav'), 'launch', 'navigation_launch.py')),
             launch_arguments={'namespace': namespace,
                               'use_sim_time': use_sim_time,
                               'autostart': autostart,

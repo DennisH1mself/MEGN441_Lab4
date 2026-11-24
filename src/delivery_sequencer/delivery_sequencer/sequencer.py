@@ -45,6 +45,7 @@ class Sequencer(Node):
         self.declare_parameter('delivery_pose', Parameter.Type.DOUBLE_ARRAY)
         self.declare_parameter('place_target', Parameter.Type.DOUBLE_ARRAY)
         self.declare_parameter('pick_pitch', -45.0)
+        self.declare_parameter('pickup_reach_margin', 0.05)  # Metres of spare forward reach.
 
         self.navigation_client = ActionClient(
             self, NavigateToPose, '/navigate')
@@ -270,7 +271,7 @@ class Sequencer(Node):
             robot = self.tf_buffer.lookup_transform(
                 'map', 'base_footprint', Time()).transform.translation
             yaw = math.atan2(block.y - robot.y, block.x - robot.x)
-            stand_off = 0.25  # Metres from robot base to block; tune for the arm.
+            stand_off = 0.25 - self.pickup_reach_margin
 
             nav_goal = NavigateToPose.Goal()
             nav_goal.pose.header.frame_id = 'map'
@@ -440,6 +441,13 @@ class Sequencer(Node):
         finally:
             self.arm_goal = None
 
+    @property
+    def pickup_reach_margin(self):
+        margin = self.get_parameter('pickup_reach_margin').value
+        if not 0.0 <= margin < 0.25:
+            raise ValueError('pickup_reach_margin must be in [0, 0.25) metres')
+        return margin
+
     def get_pick_target(self):
         block = self.get_block_position('base_footprint')
         if block is None:
@@ -456,6 +464,16 @@ class Sequencer(Node):
                 f'{error} Block target in base_footprint: '
                 f'x={target.x:.3f}, y={target.y:.3f}, z={target.z:.3f}, '
                 f'pitch={target.pitch:.1f}') from error
+        # Keep approaching until the arm has spare reach. Only the measured
+        # block target below is sent to the arm.
+        margin = self.pickup_reach_margin
+        if margin:
+            try:
+                inverse_kinematics(Move.Goal(
+                    x=target.x + margin, y=target.y, z=target.z,
+                    roll=target.roll, pitch=target.pitch))
+            except ValueError as error:
+                raise ValueError(f'Approaching for {margin:.2f} m of spare arm reach') from error
         return target
 
     def get_block_position(self, target_frame):
