@@ -31,6 +31,7 @@ def generate_launch_description():
                 'map': LaunchConfiguration('map'),
                 'params_file': LaunchConfiguration('params_file'),
                 'use_sim_time': 'false',
+                'log_level': 'info',
             }.items()),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(

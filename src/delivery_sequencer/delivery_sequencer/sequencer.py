@@ -1,14 +1,17 @@
 from enum import Enum
 import math
+import os
 
 import rclpy
 from action_msgs.msg import GoalStatus
+from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PointStamped
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient, ActionServer, GoalResponse, CancelResponse
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.time import Time
+from rosbot_arm.ik_node import inverse_kinematics
 from rosbot_msgs.action import FindAndPick, Move
 from rosbot_msgs.msg import BlockDetection
 from tf2_geometry_msgs import do_transform_point
@@ -36,6 +39,8 @@ class Sequencer(Node):
         self.delivery_goal = None
         self.target_color = None
         self.block_found = False
+        self.block_in_range = False
+        self.approach_block = None
         # Required for place/both: map [x, y, yaw] and arm [x, y, z, roll, pitch].
         self.declare_parameter('delivery_pose', Parameter.Type.DOUBLE_ARRAY)
         self.declare_parameter('place_target', Parameter.Type.DOUBLE_ARRAY)
@@ -100,6 +105,7 @@ class Sequencer(Node):
         self.target_color = color if mode != 'place' else None
         self.block_locations = {color: None for color in self.block_locations}
         self.block_found = False
+        self.approach_block = None
         self.delivery_goal = None
         self.state = (SequencerState.MOVING_TO_PLACE_POSITION if mode == 'place'
                       else SequencerState.MOVING_TO_BLOCK_ESTIMATE)
@@ -233,6 +239,9 @@ class Sequencer(Node):
     async def move_to_block_in_sight(self, goal_handle):
         self.delivery_goal = goal_handle
         self.state = SequencerState.MOVING_TO_BLOCK_IN_SIGHT
+        self.target_color = goal_handle.request.block_color.lower()
+        self.block_in_range = False
+        self.approach_block = None
         try:
             if goal_handle.is_cancel_requested:
                 return False
@@ -255,6 +264,8 @@ class Sequencer(Node):
             block = do_transform_point(point, transform).point
             if not all(math.isfinite(v) for v in (block.x, block.y, block.z)):
                 raise RuntimeError('Block position is invalid')
+            if self.get_block_position('odom') is None:
+                raise RuntimeError('Cannot track the detected block in odom')
 
             robot = self.tf_buffer.lookup_transform(
                 'map', 'base_footprint', Time()).transform.translation
@@ -268,6 +279,10 @@ class Sequencer(Node):
             nav_goal.pose.pose.position.y = block.y - stand_off * math.sin(yaw)
             nav_goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
             nav_goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
+            # Plan once: replanning this short approach can create a large loop.
+            nav_goal.behavior_tree = os.path.join(
+                get_package_share_directory('delivery_sequencer'),
+                'behavior_trees', 'approach_block.xml')
 
             nav_handle = await self.navigation_client.send_goal_async(
                 nav_goal, feedback_callback=self.navigation_feedback_callback)
@@ -278,12 +293,17 @@ class Sequencer(Node):
             if goal_handle.is_cancel_requested:
                 nav_handle.cancel_goal_async()
             self.publish_feedback(goal_handle, 'Approaching the detected block')
+            self.navigation_feedback_callback(None)
             response = await nav_handle.get_result_async()
             if goal_handle.is_cancel_requested:
                 return False
-            if response.status != GoalStatus.STATUS_SUCCEEDED:
+            if (response.status != GoalStatus.STATUS_SUCCEEDED and not (
+                    response.status == GoalStatus.STATUS_CANCELED and
+                    self.block_in_range)):
                 raise RuntimeError('Approach navigation failed')
 
+            # Navigation arriving does not guarantee that the arm can reach.
+            self.get_pick_target()
             self.state = SequencerState.PICKING_BLOCK
             return True
         except Exception as error:
@@ -303,15 +323,7 @@ class Sequencer(Node):
                 return False
             if not self.pick_client.server_is_ready():
                 raise RuntimeError('Pick server is not ready')
-            block = self.get_block_position('base_footprint')
-            if block is None:
-                raise RuntimeError('No recent block position available for picking')
-
-            # Preserve the camera offsets used by the previous arm sequencer.
-            target = Move.Goal(
-                x=block.point.x, y=block.point.y + 0.02,
-                z=block.point.z - 0.01, roll=0.0,
-                pitch=float(self.get_parameter('pick_pitch').value))
+            target = self.get_pick_target()
             self.publish_feedback(goal_handle, 'Picking the block')
             arm_handle = await self.pick_client.send_goal_async(
                 target, feedback_callback=self.pick_feedback_callback)
@@ -428,19 +440,65 @@ class Sequencer(Node):
         finally:
             self.arm_goal = None
 
+    def get_pick_target(self):
+        block = self.get_block_position('base_footprint')
+        if block is None:
+            raise ValueError('No recent block position available for picking')
+        # Use the same calibrated target for the reach check and the pick.
+        target = Move.Goal(
+            x=block.point.x, y=block.point.y + 0.02,
+            z=block.point.z - 0.01, roll=0.0,
+            pitch=float(self.get_parameter('pick_pitch').value))
+        try:
+            inverse_kinematics(target)
+        except ValueError as error:
+            raise ValueError(
+                f'{error} Block target in base_footprint: '
+                f'x={target.x:.3f}, y={target.y:.3f}, z={target.z:.3f}, '
+                f'pitch={target.pitch:.1f}') from error
+        return target
+
     def get_block_position(self, target_frame):
         detection = self.block_locations.get(self.target_color)
-        if detection is None or detection.color.lower() != self.target_color:
-            return None
-        image_time = Time.from_msg(detection.header.stamp)
-        age = (self.get_clock().now() - image_time).nanoseconds / 1e9
-        if not 0.0 <= age <= 1.0:
-            return None
+        tracking = self.state in (SequencerState.MOVING_TO_BLOCK_IN_SIGHT,
+                                  SequencerState.PICKING_BLOCK)
         try:
-            point = PointStamped()
-            point.header, point.point = detection.header, detection.position
+            now = self.get_clock().now()
+            fresh = (detection is not None and
+                     detection.color.lower() == self.target_color and
+                     0.0 <= (now - Time.from_msg(detection.header.stamp)).nanoseconds / 1e9 <= 1.0)
+            if fresh:
+                point = PointStamped()
+                point.header, point.point = detection.header, detection.position
+                image_time = Time.from_msg(detection.header.stamp)
+                if tracking:
+                    # Save a stationary point; never reuse old camera-relative XYZ.
+                    try:
+                        transform = self.tf_buffer.lookup_transform(
+                            'odom', detection.header.frame_id, image_time)
+                        point = do_transform_point(point, transform)
+                        if not all(math.isfinite(v) for v in (
+                                point.point.x, point.point.y, point.point.z)):
+                            return None
+                        point.header.stamp = detection.header.stamp
+                        self.approach_block = point
+                    except TransformException:
+                        if self.approach_block is None:
+                            raise
+            elif tracking and self.approach_block is not None:
+                point = self.approach_block
+            else:
+                return None
+
+            # During pickup, account for movement since the camera observation.
+            if tracking:
+                point = self.approach_block
+                age = (now - Time.from_msg(point.header.stamp)).nanoseconds / 1e9
+                if not 0.0 <= age <= 5.0:
+                    return None
+                image_time = Time()
             transform = self.tf_buffer.lookup_transform(
-                target_frame, detection.header.frame_id, image_time)
+                target_frame, point.header.frame_id, image_time)
             transformed = do_transform_point(point, transform)
             if not all(math.isfinite(v) for v in (
                     transformed.point.x, transformed.point.y, transformed.point.z)):
@@ -458,8 +516,30 @@ class Sequencer(Node):
                 status_msg, throttle_duration_sec=1.0)
             self.publish_feedback(self.delivery_goal, status_msg)
 
+        if self.navigation_goal is None:
+            return
+
+        if self.state == SequencerState.MOVING_TO_BLOCK_IN_SIGHT:
+            if self.block_in_range:
+                return
+            try:
+                self.get_pick_target()
+            except ValueError as error:
+                self.get_logger().warn(str(error), throttle_duration_sec=2.0)
+                if self.get_block_position('base_footprint') is None:
+                    self.state = SequencerState.FAILED
+                    self.publish_feedback(
+                        self.delivery_goal, 'Lost block position; stopping approach')
+                    self.navigation_goal.cancel_goal_async()
+                return  # Keep approaching until IK accepts the actual target.
+            self.block_in_range = True
+            self.navigation_goal.cancel_goal_async()
+            self.publish_feedback(
+                self.delivery_goal, 'Block is within arm reach; stopping approach')
+            return
+
         if (self.state != SequencerState.MOVING_TO_BLOCK_ESTIMATE or
-                self.navigation_goal is None or self.block_found):
+                self.block_found):
             return
 
         detection = self.block_locations.get(self.target_color)

@@ -24,6 +24,7 @@
   <exec_depend>rosbot_nav</exec_depend>
   <exec_depend>block_detector</exec_depend>
   <exec_depend>nav_manager</exec_depend>
+  <exec_depend>nav2_bt_navigator</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

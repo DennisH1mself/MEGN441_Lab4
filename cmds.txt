@@ -43,6 +43,6 @@ ros2 launch delivery_sequencer full_system_launch.py
 ros2 launch rosbot_nav rviz_launch.py
 ros2 topic echo /clicked_point
 ros2 action send_goal /find_and_pick rosbot_msgs/action/FindAndPick \
-"{mode: pick, estimated_x: PICK_X, estimated_y: PICK_Y, block_color: red}" \
+"{mode: pick, estimated_x: -3.602843999862671, estimated_y: -2.2334811687469482, block_color: red}" \
 --feedback
 

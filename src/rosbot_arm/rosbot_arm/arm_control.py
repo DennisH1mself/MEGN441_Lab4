@@ -1,68 +1,42 @@
 import math
-import threading
 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from ros_robot_controller.ros_robot_controller_sdk import Board
+from ros_robot_controller_msgs.msg import BusServoState, SetBusServoState
 from rosbot_msgs.msg import JointControl
 from rosbot_msgs.srv import GetJointAngle
 
 class ArmControl(Node):
     def __init__(self):
         super().__init__('arm_control')
-        self.board = Board()
-        self.board.enable_reception()
+        # The base controller owns the serial port and also receives the IMU.
+        self.servo_pub = self.create_publisher(
+            SetBusServoState, '/ros_robot_controller/bus_servo/set_state', 10)
         self.subscriber = self.create_subscription(JointControl, '/joint_control', self.arm_control_callback, 10)
         self.service = self.create_service(GetJointAngle, '/get_joint_angle', self.get_joint_angle_callback)
         self.joint_state_pub = self.create_publisher(JointState, '/controller_manager/joint_states', 10)
         self._joint_state = None
-        self._joint_state_lock = threading.Lock()
-        self._stop_feedback = threading.Event()
-        self.feedback_timer = self.create_timer(0.1, self.publish_joint_states)
-        # SDK reads can block, so keep them outside the ROS executor.
-        self.feedback_thread = threading.Thread(target=self.read_joint_states, daemon=True)
-        self.feedback_thread.start()
+        # Reuse measured feedback; servo reads in the base executor can block driving.
+        self.joint_state_sub = self.create_subscription(
+            JointState, '/joint_states', self.joint_state_callback, 10)
 
-    def read_joint_states(self):
-        while not self._stop_feedback.is_set():
-            try:
-                positions = []
-                for servo_id in range(1, 6):
-                    reading = self.board.bus_servo_read_position(servo_id)
-                    if not reading or not 0 <= reading[0] <= 1000:
-                        raise ValueError(f'No valid position for servo {servo_id}')
-                    # Factory URDF calibration: pulse 500 is zero; signs are reversed.
-                    positions.append(math.radians((500.0 - reading[0]) * 240.0 / 1000.0))
-                    if self._stop_feedback.is_set():
-                        return
-                state = JointState()
-                state.header.stamp = self.get_clock().now().to_msg()
-                state.name = [f'joint{i}' for i in range(1, 6)]
-                state.position = positions
-                with self._joint_state_lock:
-                    self._joint_state = state
-            except Exception as e:
-                if not self._stop_feedback.is_set():
-                    self.get_logger().warn(f'Joint feedback error: {e}', throttle_duration_sec=5.0)
-            self._stop_feedback.wait(0.2)
-
-    def publish_joint_states(self):
-        with self._joint_state_lock:
-            state = self._joint_state
-            self._joint_state = None
-        if state is not None:
-            self.joint_state_pub.publish(state)
-
-    def destroy_node(self):
-        self._stop_feedback.set()
-        # Do not wait indefinitely if the SDK is waiting for a servo reply.
-        self.feedback_thread.join(timeout=0.5)
-        return super().destroy_node()
+    def joint_state_callback(self, msg):
+        if len(msg.name) != len(msg.position):
+            self.get_logger().warn('Incomplete joint feedback', throttle_duration_sec=5.0)
+            return
+        self._joint_state = msg
+        self.joint_state_pub.publish(msg)
 
     def get_joint_angle_callback(self, request, response):
-        reading = self.board.bus_servo_read_position(request.joint_id)
-        response.angle = pta(float(reading[0]))
+        joint_name = f'joint{request.joint_id}'
+        try:
+            index = self._joint_state.name.index(joint_name)
+            # Factory joint states use the opposite sign to servo angles.
+            response.angle = float(round(-math.degrees(self._joint_state.position[index])))
+        except (AttributeError, ValueError, IndexError):
+            self.warn(f'No joint feedback available for {joint_name}')
+            response.angle = math.nan
         return response
     def warn(self, msg):
         self.get_logger().warn(msg)
@@ -89,7 +63,10 @@ class ArmControl(Node):
         ]
         targets.append((10, msg.gripper))
         duration = 1.0 # Time to complete motion
-        self.board.bus_servo_set_position(duration, targets)
+        self.servo_pub.publish(SetBusServoState(
+            duration=duration,
+            state=[BusServoState(present_id=[1, servo_id], position=[1, pulse])
+                   for servo_id, pulse in targets]))
 
 
 def atp(angle):
