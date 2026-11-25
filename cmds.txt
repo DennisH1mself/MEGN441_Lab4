@@ -11,7 +11,7 @@ source install/setup.zsh
  - Create local SSH key
 ssh-keygen -t ed25519 -f ~/.ssh/rosbot
  - Install public key on robot: 
- ssh-copy-id -i ~/.ssh/rosbot.pub ubuntu@192.168.55.1
+ssh-copy-id -i ~/.ssh/rosbot.pub ubuntu@192.168.55.1
 ssh-copy-id -i ~/.ssh/id_ed25519.pub ubuntu@192.168.55.1
 
  - Navigation Setup:
